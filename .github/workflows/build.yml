@@ -1,0 +1,232 @@
+name: Build AutoKlik Pro V88 Signed
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build signed release APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: ''
+
+      - name: Install required Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          yes | sdkmanager --licenses >/dev/null || true
+
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+
+          sdkmanager --list_installed | grep -E \
+            'platform-tools|platforms;android-35|build-tools;35.0.0' || true
+
+      - name: Setup Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Locate AutoKlik Pro source ZIP
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          EXACT="AutoKlikPro_V88_FINAL_FIX_RETRY25_MUSIC_STATS_SIGNED.zip"
+
+          if [ -f "$EXACT" ]; then
+            SOURCE_ZIP="$EXACT"
+          else
+            mapfile -t ZIPS < <(find . -maxdepth 2 -type f \
+              -name 'AutoKlikPro_V88_*.zip' \
+              -not -path './.git/*' | sort)
+
+            if [ "${#ZIPS[@]}" -eq 1 ]; then
+              SOURCE_ZIP="${ZIPS[0]}"
+            else
+              echo "ERROR: Source ZIP tidak ditemukan secara unik."
+              echo "ZIP yang ditemukan:"
+              printf '%s\n' "${ZIPS[@]:-<tidak ada>}"
+              exit 1
+            fi
+          fi
+
+          echo "SOURCE_ZIP=$SOURCE_ZIP"
+          echo "source_zip=$SOURCE_ZIP" >> "$GITHUB_OUTPUT"
+
+      - name: Extract source ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf source extracted
+          mkdir -p extracted
+
+          unzip -q "${{ steps.source.outputs.source_zip }}" -d extracted
+
+          echo "Isi hasil extract:"
+          find extracted -maxdepth 3 -type f | sort | head -200
+
+      - name: Locate Gradle project
+        id: project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SETTINGS="$(find extracted -type f \
+            \( -name 'settings.gradle' -o -name 'settings.gradle.kts' \) \
+            -print -quit)"
+
+          if [ -z "$SETTINGS" ]; then
+            echo "ERROR: settings.gradle/settings.gradle.kts tidak ditemukan."
+            find extracted -maxdepth 5 -type f | sort | head -300
+            exit 1
+          fi
+
+          PROJECT_DIR="$(dirname "$SETTINGS")"
+
+          echo "Gradle project ditemukan di: $PROJECT_DIR"
+
+          if [ ! -f "$PROJECT_DIR/build.gradle" ] && \
+             [ ! -f "$PROJECT_DIR/build.gradle.kts" ]; then
+            echo "ERROR: build.gradle/build.gradle.kts tidak ditemukan."
+            exit 1
+          fi
+
+          if [ ! -d "$PROJECT_DIR/app" ]; then
+            echo "ERROR: folder app tidak ditemukan."
+            exit 1
+          fi
+
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Create temporary signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$RUNNER_TEMP/autoklik-signing"
+
+          keytool -genkeypair \
+            -v \
+            -keystore "$RUNNER_TEMP/autoklik-signing/release.keystore" \
+            -storetype PKCS12 \
+            -alias autoklik-release \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 3650 \
+            -storepass "autoklik-temp-pass" \
+            -keypass "autoklik-temp-pass" \
+            -dname "CN=AutoKlik Pro, OU=Manzx Digital, O=Manzx Digital, L=Indonesia, ST=West Java, C=ID"
+
+          echo "AUTO_KS_PATH=$RUNNER_TEMP/autoklik-signing/release.keystore" >> "$GITHUB_ENV"
+          echo "AUTO_KS_PASSWORD=autoklik-temp-pass" >> "$GITHUB_ENV"
+          echo "AUTO_KS_ALIAS=autoklik-release" >> "$GITHUB_ENV"
+
+      - name: Build signed release APK
+        working-directory: ${{ steps.project.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Gradle version:"
+          gradle --version
+
+          echo "Building release APK..."
+
+          gradle \
+            --no-daemon \
+            --stacktrace \
+            clean \
+            assembleRelease \
+            --console=plain
+
+      - name: Locate generated APK
+        id: apk
+        working-directory: ${{ steps.project.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -t APKS < <(
+            find app/build/outputs/apk/release \
+            -type f \
+            -name '*.apk' \
+            | sort
+          )
+
+          if [ "${#APKS[@]}" -eq 0 ]; then
+            echo "ERROR: APK release tidak ditemukan."
+            find app/build/outputs -maxdepth 6 -type f 2>/dev/null | sort || true
+            exit 1
+          fi
+
+          APK="${APKS[0]}"
+
+          echo "APK ditemukan: $APK"
+          echo "apk=$APK" >> "$GITHUB_OUTPUT"
+
+      - name: Verify APK signature
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK="${{ steps.project.outputs.project_dir }}/${{ steps.apk.outputs.apk }}"
+
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify \
+            --verbose \
+            "$APK"
+
+      - name: Check APK package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK="${{ steps.project.outputs.project_dir }}/${{ steps.apk.outputs.apk }}"
+
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | head -20
+
+      - name: Copy final APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p release
+
+          APK="${{ steps.project.outputs.project_dir }}/${{ steps.apk.outputs.apk }}"
+
+          cp "$APK" "release/AutoKlikPro-V88-FINAL-FIX-SIGNED.apk"
+
+          ls -lh release/AutoKlikPro-V88-FINAL-FIX-SIGNED.apk
+
+      - name: Upload signed APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoKlikPro-V88-FINAL-FIX-SIGNED
+          path: release/AutoKlikPro-V88-FINAL-FIX-SIGNED.apk
+          if-no-files-found: error
+          retention-days: 14
