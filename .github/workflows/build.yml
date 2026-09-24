@@ -3,19 +3,17 @@ name: Build AutoKlik Pro V88 Signed
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
-      - master
+    branches: [main, master]
 
 permissions:
   contents: read
 
+# Upload ZIP ini ke root repository sebelum menjalankan workflow.
 env:
-  JAVA_VERSION: '17'
+  SOURCE_ZIP: AutoKlikPro_V88_LICENSE_UI_RETRY_MUSIC_FIX_FINAL.zip
   ANDROID_API: '35'
   BUILD_TOOLS: '35.0.0'
   GRADLE_VERSION: '8.9'
-  SOURCE_ZIP: 'AutoKlikPro_V88_FINAL_FIX_RETRY25_MUSIC_STATS_SIGNED_BOUNDS_FIX.zip'
 
 jobs:
   build:
@@ -30,34 +28,65 @@ jobs:
         uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: '${{ env.JAVA_VERSION }}'
+          java-version: '17'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v4
-        with:
-          packages: ''
-
-      - name: Install required Android SDK packages
+      - name: Prepare Android SDK
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-}"
-          echo "ANDROID_HOME=${ANDROID_HOME:-}"
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
 
-          sdkmanager --version
+          if [[ -z "$SDK_ROOT" || ! -d "$SDK_ROOT" ]]; then
+            echo "::error::Android SDK tidak ditemukan pada runner."
+            exit 1
+          fi
 
-          set +o pipefail
-          yes | sdkmanager --licenses >/dev/null 2>&1 || true
-          set -o pipefail
+          export ANDROID_HOME="$SDK_ROOT"
+          export ANDROID_SDK_ROOT="$SDK_ROOT"
 
-          sdkmanager --install \
+          SDKMANAGER="$(command -v sdkmanager || true)"
+
+          if [[ -z "$SDKMANAGER" ]]; then
+            SDKMANAGER="$(
+              find "$SDK_ROOT/cmdline-tools" \
+                -type f \
+                -name sdkmanager \
+                -print \
+                -quit 2>/dev/null || true
+            )"
+          fi
+
+          if [[ -z "$SDKMANAGER" ]]; then
+            echo "::error::sdkmanager tidak ditemukan."
+
+            find "$SDK_ROOT" \
+              -maxdepth 5 \
+              -type f \
+              -name sdkmanager \
+              -print 2>/dev/null || true
+
+            exit 1
+          fi
+
+          SDK_BIN="$(dirname "$SDKMANAGER")"
+
+          echo "$SDK_BIN" >> "$GITHUB_PATH"
+          echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+
+          "$SDKMANAGER" \
             "platform-tools" \
             "platforms;android-${ANDROID_API}" \
             "build-tools;${BUILD_TOOLS}"
 
-          test -x "$ANDROID_HOME/build-tools/${BUILD_TOOLS}/apksigner"
-          test -x "$ANDROID_HOME/build-tools/${BUILD_TOOLS}/aapt"
+          echo "Android SDK ready: $SDK_ROOT"
+
+          "$SDKMANAGER" --version
 
       - name: Setup Gradle 8.9
         uses: gradle/actions/setup-gradle@v4
@@ -65,7 +94,7 @@ jobs:
           gradle-version: '${{ env.GRADLE_VERSION }}'
           cache-disabled: true
 
-      - name: Locate AutoKlik Pro source ZIP
+      - name: Locate source ZIP
         id: source
         shell: bash
         run: |
@@ -76,36 +105,31 @@ jobs:
           if [[ -f "$SOURCE_ZIP" ]]; then
             ZIP="$SOURCE_ZIP"
           else
-            mapfile -t candidates < <(
+            ZIP="$(
               find . \
-                -maxdepth 5 \
+                -maxdepth 3 \
                 -type f \
-                -name 'AutoKlikPro_V88_*.zip' \
-                -not -path './.git/*' \
-                | sort
-            )
-
-            if (( ${#candidates[@]} == 1 )); then
-              ZIP="${candidates[0]}"
-            fi
+                -iname 'AutoKlikPro_V88*.zip' \
+                -print | sort | tail -n 1
+            )"
           fi
 
-          if [[ -z "$ZIP" ]]; then
-            echo "::error::Source ZIP tidak ditemukan: $SOURCE_ZIP"
-            echo
+          if [[ -z "$ZIP" || ! -f "$ZIP" ]]; then
+            echo "::error::Source ZIP AutoKlik Pro V88 tidak ditemukan."
+
             echo "ZIP yang tersedia:"
             find . \
-              -maxdepth 5 \
+              -maxdepth 4 \
               -type f \
-              -name '*.zip' \
-              -not -path './.git/*' \
-              -print \
-              | sort || true
+              -iname '*.zip' \
+              -print | sort || true
+
             exit 1
           fi
 
-          echo "Using source ZIP: $ZIP"
           echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+
+          echo "Source ZIP: $ZIP"
 
       - name: Extract source ZIP
         id: extract
@@ -126,179 +150,191 @@ jobs:
             find "$OUT" \
               -type f \
               \( \
-                -name 'settings.gradle' \
+                -name settings.gradle \
                 -o \
-                -name 'settings.gradle.kts' \
+                -name settings.gradle.kts \
               \) \
               -print \
               -quit
           )"
 
           if [[ -z "$SETTINGS" ]]; then
-            echo "::error::settings.gradle/settings.gradle.kts tidak ditemukan."
-            echo
-            echo "Struktur ZIP:"
-            find "$OUT" -maxdepth 6 -type f | sort | head -300
+            echo "::error::settings.gradle tidak ditemukan di dalam ZIP."
+
+            find "$OUT" \
+              -maxdepth 7 \
+              -type f \
+              -print | sort
+
             exit 1
           fi
 
           PROJECT="$(dirname "$SETTINGS")"
 
-          echo "Project root:"
-          echo "$PROJECT"
-
-          if [[ ! -f "$PROJECT/build.gradle" ]] && \
-             [[ ! -f "$PROJECT/build.gradle.kts" ]]; then
-            echo "::error::build.gradle/build.gradle.kts tidak ditemukan."
-            exit 1
-          fi
-
-          if [[ ! -d "$PROJECT/app" ]]; then
-            echo "::error::folder app tidak ditemukan."
-            exit 1
-          fi
-
           echo "project=$PROJECT" >> "$GITHUB_OUTPUT"
 
-      - name: Create temporary signing key
-        shell: bash
-        run: |
-          set -euo pipefail
+          echo "Project: $PROJECT"
 
-          KEY_DIR="$RUNNER_TEMP/autoklik-signing"
-
-          rm -rf "$KEY_DIR"
-          mkdir -p "$KEY_DIR"
-
-          keytool -genkeypair \
-            -v \
-            -keystore "$KEY_DIR/release.keystore" \
-            -storetype PKCS12 \
-            -alias autoklik-release \
-            -keyalg RSA \
-            -keysize 2048 \
-            -validity 3650 \
-            -storepass "autoklik-temp-pass" \
-            -keypass "autoklik-temp-pass" \
-            -dname "CN=AutoKlik Pro, OU=Manzx Digital, O=Manzx Digital, L=Indonesia, ST=West Java, C=ID"
-
-          echo "AUTO_KS_PATH=$KEY_DIR/release.keystore" >> "$GITHUB_ENV"
-          echo "AUTO_KS_PASSWORD=autoklik-temp-pass" >> "$GITHUB_ENV"
-          echo "AUTO_KS_ALIAS=autoklik-release" >> "$GITHUB_ENV"
-
-      - name: Build signed release APK
+      - name: Validate fixed source
         working-directory: ${{ steps.extract.outputs.project }}
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "======================================"
-          echo "BUILD AUTOKLIK PRO V88"
-          echo "======================================"
+          LM="app/src/main/java/com/manzxdigital/autoklikpro/LicenseManager.java"
+          AS="app/src/main/java/com/manzxdigital/autoklikpro/engine/AppState.java"
+          PR="app/src/main/java/com/manzxdigital/autoklikpro/PendingRetryEngine.java"
+          AU="app/src/main/java/com/manzxdigital/autoklikpro/AutomationAccessibilityService.java"
+          MS="app/src/main/java/com/manzxdigital/autoklikpro/SpotifyMediaNotificationService.java"
+          MA="app/src/main/java/com/manzxdigital/autoklikpro/MainActivity.java"
+          NC="app/src/main/java/com/manzxdigital/autoklikpro/NeonChartView.java"
 
-          echo
-          echo "Gradle:"
-          gradle --version
+          for f in \
+            "$LM" \
+            "$AS" \
+            "$PR" \
+            "$AU" \
+            "$MS" \
+            "$MA" \
+            "$NC" \
+            app/src/main/AndroidManifest.xml \
+            app/src/main/res/layout/activity_license.xml
+          do
+            test -f "$f" || {
+              echo "::error::File hilang: $f"
+              exit 1
+            }
+          done
 
-          echo
-          echo "Android SDK:"
-          echo "$ANDROID_HOME"
+          grep -q 'PAYLOAD_SIZE = 22' "$LM"
+          grep -q 'SIGNATURE_SIZE = 64' "$LM"
+          grep -q 'decodeBase64Compat' "$LM"
 
-          echo
-          echo "Building release APK..."
+          ! grep \
+            -A12 \
+            'private static String normalizeKey' \
+            "$LM" | grep -q 'toUpperCase'
+
+          grep -q 'persistent.getInt("success"' "$AS"
+          grep -q 'getPersistent("success") + 1' "$AS"
+          grep -q 'getPersistent("retry") + 1' "$AS"
+
+          grep -q 'pendingAutoOpenTriggered' "$AU"
+          grep -q 'isPendingScreen(root)' "$PR"
+          grep -q '60x' "$PR"
+          grep -q 'SPOTIFY' "$MS"
+
+          grep -q 'applyLicenseInsets' "$MA"
+          grep -q 'setSingleLine(true)' "$MA"
+          grep -q 'formatAxis' "$NC"
+
+          echo "Source validation: OK"
+
+      - name: Make Gradle executable
+        working-directory: ${{ steps.extract.outputs.project }}
+        shell: bash
+        run: |
+          chmod +x gradlew 2>/dev/null || true
+
+      - name: Build unsigned release APK
+        working-directory: ${{ steps.extract.outputs.project }}
+        shell: bash
+        run: |
+          set -euo pipefail
 
           gradle \
             --no-daemon \
             --stacktrace \
             clean \
-            assembleRelease \
-            --console=plain
+            assembleRelease
 
-      - name: Locate generated APK
+      - name: Locate unsigned APK
         id: apk
         working-directory: ${{ steps.extract.outputs.project }}
         shell: bash
         run: |
           set -euo pipefail
 
-          mapfile -t APKS < <(
+          APK="$(
             find app/build/outputs/apk/release \
               -type f \
               -name '*.apk' \
-              | sort
-          )
-
-          if (( ${#APKS[@]} == 0 )); then
-            echo "::error::APK release tidak ditemukan."
-
-            echo
-            echo "Isi output:"
-            find app/build/outputs \
-              -maxdepth 8 \
-              -type f \
               -print \
-              | sort || true
+              -quit
+          )"
 
-            exit 1
-          fi
+          test -n "$APK"
 
-          APK="${APKS[0]}"
+          APK_ABS="$(realpath "$APK")"
 
-          echo "APK ditemukan:"
-          echo "$APK"
+          echo "apk=$APK_ABS" >> "$GITHUB_OUTPUT"
 
-          echo "apk=$APK" >> "$GITHUB_OUTPUT"
+          echo "APK: $APK_ABS"
 
-      - name: Verify APK signature
+      - name: Generate temporary signing key
         shell: bash
         run: |
           set -euo pipefail
 
-          APK="${{ steps.extract.outputs.project }}/${{ steps.apk.outputs.apk }}"
+          KS="$RUNNER_TEMP/autoklik-release.jks"
 
-          echo "Verifying:"
-          echo "$APK"
+          PASSWORD="$(
+            python3 -c \
+              'import secrets; print(secrets.token_urlsafe(32))'
+          )"
 
-          "$ANDROID_HOME/build-tools/${BUILD_TOOLS}/apksigner" verify \
-            --verbose \
-            "$APK"
+          keytool -genkeypair -v \
+            -keystore "$KS" \
+            -storepass "$PASSWORD" \
+            -keypass "$PASSWORD" \
+            -alias autoklik-release \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 3650 \
+            -dname \
+              'CN=AutoKlik Pro, OU=AutoKlik Pro, O=MANZX DIGITAL, C=ID'
 
-      - name: Check APK package
-        shell: bash
-        run: |
-          set -euo pipefail
+          echo "KS=$KS" >> "$GITHUB_ENV"
+          echo "KS_PASSWORD=$PASSWORD" >> "$GITHUB_ENV"
 
-          APK="${{ steps.extract.outputs.project }}/${{ steps.apk.outputs.apk }}"
+          chmod 600 "$KS"
 
-          echo "APK package information:"
-
-          "$ANDROID_HOME/build-tools/${BUILD_TOOLS}/aapt" \
-            dump badging \
-            "$APK" \
-            | head -30
-
-      - name: Copy final APK
+      - name: Zipalign and sign release APK
         shell: bash
         run: |
           set -euo pipefail
 
           mkdir -p release
 
-          APK="${{ steps.extract.outputs.project }}/${{ steps.apk.outputs.apk }}"
+          ALIGNED="$RUNNER_TEMP/autoklik-aligned.apk"
 
-          cp \
-            "$APK" \
-            "release/AutoKlikPro-V88-FINAL-FIX-SIGNED.apk"
+          FINAL="release/AutoKlikPro-V88-Signed-FIXED.apk"
 
-          echo
-          echo "FINAL APK:"
-          ls -lh \
-            "release/AutoKlikPro-V88-FINAL-FIX-SIGNED.apk"
+          "$ANDROID_HOME/build-tools/${BUILD_TOOLS}/zipalign" \
+            -f \
+            -p \
+            4 \
+            "${{ steps.apk.outputs.apk }}" \
+            "$ALIGNED"
+
+          "$ANDROID_HOME/build-tools/${BUILD_TOOLS}/apksigner" sign \
+            --ks "$KS" \
+            --ks-pass "pass:$KS_PASSWORD" \
+            --key-pass "pass:$KS_PASSWORD" \
+            --ks-key-alias autoklik-release \
+            --out "$FINAL" \
+            "$ALIGNED"
+
+          "$ANDROID_HOME/build-tools/${BUILD_TOOLS}/apksigner" \
+            verify \
+            --verbose \
+            "$FINAL"
+
+          echo "Signed APK: $FINAL"
 
       - name: Upload signed APK
         uses: actions/upload-artifact@v4
         with:
-          name: AutoKlikPro-V88-FINAL-FIX-SIGNED
-          path: release/AutoKlikPro-V88-FINAL-FIX-SIGNED.apk
+          name: AutoKlikPro-V88-Signed-FIXED
+          path: release/AutoKlikPro-V88-Signed-FIXED.apk
           if-no-files-found: error
-          retention-days: 14
